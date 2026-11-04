@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.18.4/.schema/devbox.schema.json",
+  "packages": [
+    "python@3.13",
+    "uv@latest",
+    "go-task@3.53.1"
+  ],
+  "env": {
+    "UV_PYTHON_DOWNLOADS": "never"
+  }
+}
