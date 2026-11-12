@@ -1,7 +1,7 @@
 [project]
 name = "coupled-tags-lint"
-version = "0.1.0"
-description = "Checks the COUPLED:<key>: tags in a repository: their form, and that the values they relate agree."
+version = "0.2.0"
+description = "Checks the COUPLED:<key>:[<relation>] tags in a repository: their form, and that the values they relate agree."
 requires-python = ">=3.13"
 dependencies = ["cli-kit"]
 
@@ -9,7 +9,7 @@ dependencies = ["cli-kit"]
 coupled-tags-lint = "coupled_tags_lint.__main__:main"
 
 [tool.uv.sources]
-# COUPLED:cli-kit-version: = @/tag = "([^"]+)"/
+# COUPLED:cli-kit-version:[=; @/tag = "([^"]+)"/]
 cli-kit = { git = "https://github.com/ianflanagan1/cli-kit", tag = "v0.1.0" }
 
 [dependency-groups]

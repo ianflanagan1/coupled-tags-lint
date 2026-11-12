@@ -11,3 +11,7 @@ class LocalFiles:
                 return f.read()
         except (OSError, UnicodeDecodeError):
             return None
+
+    def write(self, path: str, content: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)

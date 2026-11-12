@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "keys": {
+    "cli-kit-version": [
+      {"path": "flake.nix", "relation": "=; @/cli-kit/(v[0-9.]+)/"},
+      {"path": "pyproject.toml", "relation": "=; @/tag = \"([^\"]+)\"/"}
+    ]
+  }
+}

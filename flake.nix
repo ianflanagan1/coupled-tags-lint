@@ -1,8 +1,8 @@
 {
-  description = "coupled-tags-lint: check the COUPLED:<key>: tags in a repository, and that their relations hold";
+  description = "coupled-tags-lint: check the COUPLED:<key>:[<relation>] tags in a repository, and that their relations hold";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-  # COUPLED:cli-kit-version: = @/cli-kit/(v[0-9.]+)/
+  # COUPLED:cli-kit-version:[=; @/cli-kit/(v[0-9.]+)/]
   inputs.cli-kit = { url = "github:ianflanagan1/cli-kit/v0.1.0"; flake = false; };
 
   outputs = { self, nixpkgs, cli-kit }:

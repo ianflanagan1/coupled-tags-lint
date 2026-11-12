@@ -1,14 +1,12 @@
-"""Finding the lines that hold `COUPLED:` with git grep, or grep outside a git work tree."""
+"""Finding the files that hold `COUPLED:` with git grep, or grep outside a git work tree."""
 
 import subprocess
 from typing import final
 
-from coupled_tags_lint.core.tags import Hit
-
 
 @final
 class GrepSearch:
-    def hits(self, root: str) -> list[Hit]:
+    def paths(self, root: str) -> list[str]:
         """In a git work tree, its tracked files and untracked files that aren't ignored;
         elsewhere every file, skipping .git, node_modules and vendor."""
         inside = subprocess.run(
@@ -20,7 +18,7 @@ class GrepSearch:
                 "grep",
                 "--untracked",
                 "-I",
-                "--line-number",
+                "--files-with-matches",
                 "--fixed-strings",
                 "COUPLED:",
                 "--",
@@ -31,7 +29,7 @@ class GrepSearch:
                 "grep",
                 "--recursive",
                 "-I",
-                "--line-number",
+                "--files-with-matches",
                 "--fixed-strings",
                 "COUPLED:",
                 "--exclude-dir=.git",
@@ -40,10 +38,4 @@ class GrepSearch:
                 ".",
             ]
         output = subprocess.run(command, cwd=root, capture_output=True, text=True).stdout
-        hits = []
-        for row in output.splitlines():
-            path, _, rest = row.partition(":")
-            line, _, text = rest.partition(":")
-            if line.isdigit():
-                hits.append(Hit(path.removeprefix("./"), int(line), text))
-        return hits
+        return [path.removeprefix("./") for path in output.splitlines() if path]

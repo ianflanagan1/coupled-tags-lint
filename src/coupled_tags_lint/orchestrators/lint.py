@@ -1,23 +1,31 @@
-"""Linting a repository's COUPLED tags: gather its tagged lines and the values its `also` notes
-reach, and check them."""
+"""Linting a repository's COUPLED tags: gather the tags in its files, the files in it that they
+refer to and the lock; with --fix, add the clauses the lint can write to the tags and gather
+again; with --update, record the groups in the lock; then check them. Files in other
+repositories aren't read."""
 
 from dataclasses import dataclass
 from typing import Protocol, final
 
-from coupled_tags_lint.core.check import Problem, Site, Source, also_entries, check, is_value_group
-from coupled_tags_lint.core.tags import AlsoEntry, Hit, Malformed, Tag, find_tags
-from coupled_tags_lint.core.values import (
-    Reading,
-    Unreadable,
-    read_file_value,
-    read_value,
-    value_line,
+from coupled_tags_lint.core import lock
+from coupled_tags_lint.core.check import (
+    Content,
+    FileRead,
+    Missing,
+    Problem,
+    Site,
+    check,
+    file_paths,
+    file_sites,
+    fixes,
+    unchecked,
 )
+from coupled_tags_lint.core.rewrite import rewritten
+from coupled_tags_lint.core.tags import Tag, Unclosed
 
 
 class TagSearch(Protocol):
-    def hits(self, root: str) -> list[Hit]:
-        """Every line under root holding `COUPLED:`."""
+    def paths(self, root: str) -> list[str]:
+        """The path, relative to root, of every file under root holding `COUPLED:`."""
         ...
 
 
@@ -26,11 +34,7 @@ class Files(Protocol):
         """The content of the file at path, or None if it can't be read."""
         ...
 
-
-class Checkouts(Protocol):
-    def find(self, name: str) -> list[str]:
-        """The paths of the checkouts of the repository called name."""
-        ...
+    def write(self, path: str, content: str) -> None: ...
 
 
 @final
@@ -39,90 +43,93 @@ class Report:
     problems: list[Problem]
     # Each key, in the order first found, with its sites' locations.
     keys: list[tuple[str, list[str]]]
+    # The repositories tags refer to files in, which weren't checked.
+    unchecked: list[str]
+    # The files --fix rewrote tags in.
+    fixed: list[str]
+    # Whether --update changed the lock.
+    updated: bool
+
+
+@final
+@dataclass(frozen=True)
+class _Gathered:
+    sites: list[Site]
+    files: dict[str, FileRead]
+    # A problem for each file holding tags that couldn't be read.
+    unreadable: list[Problem]
 
 
 @final
 class Lint:
-    def __init__(self, search: TagSearch, files: Files, checkouts: Checkouts) -> None:
+    def __init__(self, search: TagSearch, files: Files) -> None:
         self._search = search
         self._files = files
-        self._checkouts = checkouts
 
-    def run(self, root: str, excludes: list[str]) -> Report:
-        hits = [hit for hit in self._search.hits(root) if not _excluded(hit.path, excludes)]
-        lines: dict[str, list[str]] = {}
-        sites: list[Site] = []
+    def run(self, root: str, excludes: list[str], update: bool, fix: bool) -> Report:
+        gathered = self._gather(root, excludes)
+        fixed: list[str] = []
+        if fix:
+            fixed = self._fix(root, gathered)
+            if fixed:
+                gathered = self._gather(root, excludes)
+        sites = gathered.sites
+
+        now = lock.current(sites, gathered.files)
+        lock_path = root + "/" + lock.LOCK_FILE
+        text = self._files.read(lock_path)
+        old = None if text is None else lock.parse(text)
+        updated = False
+        if update:
+            new = lock.updated(old, now, excludes)
+            new_text = lock.render(new)
+            if new_text != text and (new or text is not None):
+                self._files.write(lock_path, new_text)
+                updated = True
+            old = new
+
+        problems = (
+            gathered.unreadable
+            + check(sites, gathered.files)
+            + lock.compare(old, now, excludes, lock.LOCK_FILE, lock.UPDATE)
+        )
         keys: dict[str, list[str]] = {}
-        for hit in hits:
-            if hit.path not in lines:
-                lines[hit.path] = (self._files.read(root + "/" + hit.path) or "").splitlines()
-            file_lines = lines[hit.path]
-            where = f"{hit.path}:{hit.line}"
-            for found in find_tags(hit.text):
-                code = value_line(file_lines, hit.line - 1) if hit.line <= len(file_lines) else None
-                sites.append(Site(where, found, code))
-                if not isinstance(found, Malformed):
-                    keys.setdefault(found.key, []).append(where)
+        for site in sites:
+            if isinstance(site.found, Tag | Unclosed):
+                keys.setdefault(site.found.key, []).append(site.where)
+        return Report(problems, list(keys.items()), unchecked(sites), fixed, updated)
 
-        sources: dict[str, list[Source]] = {}
-        for key, wheres in keys.items():
-            tags = [
-                site.found
-                for site in sites
-                if isinstance(site.found, Tag) and site.found.key == key
-            ]
-            if not is_value_group(tags):
+    def _gather(self, root: str, excludes: list[str]) -> _Gathered:
+        paths = [path for path in self._search.paths(root) if not lock.excluded(path, excludes)]
+        sites: list[Site] = []
+        unreadable: list[Problem] = []
+        for path in paths:
+            text = self._files.read(root + "/" + path)
+            if text is None:
+                unreadable.append(Problem(path, "Can't read this file as UTF-8 to check its tags"))
                 continue
-            tagged_paths = {where.rsplit(":", 1)[0] for where in wheres}
-            for entry in also_entries(tags):
-                if entry.repo is None and entry.path in tagged_paths:
-                    continue
-                sources.setdefault(key, []).extend(self._sources(root, key, entry))
-        return Report(check(sites, sources), list(keys.items()))
+            sites += file_sites(path, text.splitlines())
+        tags = [site.found for site in sites if isinstance(site.found, Tag)]
+        files = {path: self._read(root, path) for path in file_paths(tags)}
+        return _Gathered(sites, files, unreadable)
 
-    def _sources(self, root: str, key: str, entry: AlsoEntry) -> list[Source]:
-        """The values the `also` entry reaches: the file in this repository, or in a checkout of
-        another, by its tags of key if it has any, else by its pointer or whole content."""
-        if entry.repo is None:
-            directory = root
-        else:
-            checkouts = self._checkouts.find(entry.repo.rpartition("/")[2])
-            if not checkouts:
-                return []  # Not checked out here, so it can't be checked.
-            directory = checkouts[0]
-        content = self._files.read(directory + "/" + entry.path)
-        label = entry.text()
-        if content is None:
-            if entry.pointer is None:
-                return []  # The note only lists it, and it may be untracked, such as .env.
-            return [Source(label, label, Unreadable("the file isn't there"))]
+    def _fix(self, root: str, gathered: _Gathered) -> list[str]:
+        """Rewrites the tags fixes gives, returning the paths of the files changed."""
+        by_path: dict[str, dict[int, Tag]] = {}
+        for item in fixes(gathered.sites, gathered.files):
+            by_path.setdefault(item.path, {})[item.line] = item.tag
+        changed: list[str] = []
+        for path, tags in by_path.items():
+            text = self._files.read(root + "/" + path)
+            if text is None:
+                continue
+            lines = rewritten(text.splitlines(), tags)
+            new_text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+            if new_text != text:
+                self._files.write(root + "/" + path, new_text)
+                changed.append(path)
+        return changed
 
-        file_lines = content.splitlines()
-        tagged: list[Source] = []
-        for index, line in enumerate(file_lines):
-            for found in find_tags(line):
-                if isinstance(found, Tag) and found.key == key:
-                    where = (
-                        f"{'' if entry.repo is None else entry.repo + ': '}{entry.path}:{index + 1}"
-                    )
-                    code = value_line(file_lines, index)
-                    reading: Reading = (
-                        Unreadable("there's no line after the tag")
-                        if code is None
-                        else read_value(code, found.selector)
-                    )
-                    tagged.append(Source(where, code or "", reading))
-        if tagged:
-            # A tag here that can't be read is this repository's to report; one in another
-            # repository is that repository's, so it's left out rather than reported twice.
-            return [
-                source
-                for source in tagged
-                if entry.repo is None or not isinstance(source.reading, Unreadable)
-            ]
-        file_reading = read_file_value(content, entry.pointer)
-        return [] if file_reading is None else [Source(label, label, file_reading)]
-
-
-def _excluded(path: str, excludes: list[str]) -> bool:
-    return any(path == prefix or path.startswith(prefix + "/") for prefix in excludes)
+    def _read(self, root: str, path: str) -> FileRead:
+        content = self._files.read(root + "/" + path)
+        return Missing() if content is None else Content(content)

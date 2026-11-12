@@ -1,45 +1,98 @@
 import unittest
 from decimal import Decimal
 
-from coupled_tags_lint.core.tags import Arith, Formula, ValueOp
+from coupled_tags_lint.core.tags import Arith, Formula, ValueOp, find_tags
 from coupled_tags_lint.core.values import (
     Fails,
     Holds,
     Incomparable,
     Unreadable,
     Value,
+    block_lines,
     compare,
+    declared_name,
+    described_line,
+    json_at,
     read_file_value,
     read_value,
+    unit_of,
     value_line,
 )
+
+
+def block(*lines: str) -> list[str]:
+    """The block of the first tag in lines."""
+    placed = find_tags(list(lines))
+    return block_lines(list(lines), placed[0], placed)
 
 
 class ValueLines(unittest.TestCase):
     def test_a_trailing_tag_describes_the_code_before_its_comment(self) -> None:
         for line, code in (
-            ("MAX_UPLOAD_MB = 8  # COUPLED:x: =", "MAX_UPLOAD_MB = 8"),
-            ("client_max_body_size 10m;  # COUPLED:x: =", "client_max_body_size 10m;"),
-            ("mapId: 'a#b',  // COUPLED:x: =", "mapId: 'a#b',"),
+            ("MAX_UPLOAD_MB = 8  # COUPLED:x:[=]", "MAX_UPLOAD_MB = 8"),
+            ("client_max_body_size 10m;  # COUPLED:x:[=]", "client_max_body_size 10m;"),
+            ("mapId: 'a#b',  // COUPLED:x:[=]", "mapId: 'a#b',"),
             (
-                "xdebug.output_dir = /tmp/profiles  ; COUPLED:x: =",
+                "xdebug.output_dir = /tmp/profiles  ; COUPLED:x:[=]",
                 "xdebug.output_dir = /tmp/profiles",
             ),
-            ("- Map ID: `dog-cafe-map`. COUPLED:x: =", "- Map ID: `dog-cafe-map`."),
+            ("- Map ID: `dog-cafe-map`. COUPLED:x:[=]", "- Map ID: `dog-cafe-map`."),
         ):
-            self.assertEqual(code, value_line([line], 0), line)
+            self.assertEqual(code, value_line([line], 0, 0), line)
 
     def test_a_tag_on_a_comment_line_describes_the_next_line_of_code(self) -> None:
         lines = [
-            "# Base image. COUPLED:x: =",
-            "# COUPLED:y: same-as",
-            "",
+            "# Base image. COUPLED:x:[=] Pinned for the build.",
+            "# COUPLED:y:[same-as]",
+            "# Another comment.",
             "FROM node:24-slim  # pinned",
         ]
-        self.assertEqual("FROM node:24-slim", value_line(lines, 0))
+        self.assertEqual("FROM node:24-slim", value_line(lines, 0, 0))
+
+    def test_a_tag_running_on_over_lines_describes_the_line_of_code_after_them(self) -> None:
+        lines = ["# COUPLED:x:[=; ./.nvmrc;", "# ./package.json#/engines/node]", "FROM node:24"]
+        self.assertEqual("FROM node:24", value_line(lines, 0, 1))
+
+    def test_a_trailing_tag_running_on_describes_its_own_line(self) -> None:
+        lines = ["MAX = 8  # COUPLED:x:[<= limit;", "#   ./l.json#/limit]", "Y = 1"]
+        self.assertEqual("MAX = 8", value_line(lines, 0, 1))
+
+    def test_a_line_declares_the_name_left_of_its_assignment(self) -> None:
+        for code, name in (
+            ("MAX_UPLOAD_MB = 8", "MAX_UPLOAD_MB"),
+            ("$d = 13;", "$d"),
+            ('public const string CACHE_IGNORE = "/cache/";', "CACHE_IGNORE"),
+            ("server.keepAliveTimeout = 65_000;", "server.keepAliveTimeout"),
+            ('node-version: "24"', "node-version"),
+            ("APP_URL=http://localhost:8080", "APP_URL"),
+            ("client_max_body_size 10m;", "client_max_body_size"),
+        ):
+            self.assertEqual(name, declared_name(code), code)
+
+    def test_a_line_that_names_nothing_declares_no_name(self) -> None:
+        for code in ("FROM node:24.22.1-slim", "- Map ID: `dog-cafe-map`.", "if a == b:"):
+            self.assertIsNone(declared_name(code), code)
+
+    def test_a_tag_with_a_blank_line_before_its_code_describes_nothing(self) -> None:
+        self.assertIsNone(value_line(["# COUPLED:x:[=]", "", "X = 1"], 0, 0))
+        self.assertEqual([], block("# COUPLED:x:[same-as]", "", "def f():"))
 
     def test_a_tag_with_no_code_after_it_describes_nothing(self) -> None:
-        self.assertIsNone(value_line(["# COUPLED:x: =", "# end"], 0))
+        self.assertIsNone(value_line(["# COUPLED:x:[=]", "# end"], 0, 0))
+
+
+class DescribedLines(unittest.TestCase):
+    def test_a_trailing_tag_describes_its_own_line(self) -> None:
+        self.assertEqual(0, described_line(["X = 1  # COUPLED:x:[=]", "Y = 2"], 0, 0))
+
+    def test_a_tag_on_its_own_line_describes_the_next_line_past_comments(self) -> None:
+        self.assertEqual(2, described_line(["# COUPLED:x:[=]", "# More words.", "X = 1"], 0, 0))
+
+    def test_a_tag_on_its_own_line_of_markdown_describes_the_next_line(self) -> None:
+        self.assertEqual(1, described_line(["COUPLED:x:[same-as]", "- rule: A unit is"], 0, 0))
+
+    def test_a_tag_with_a_blank_line_before_its_code_describes_no_line(self) -> None:
+        self.assertIsNone(described_line(["COUPLED:x:[same-as]", "", "- rule: A unit is"], 0, 0))
 
 
 class ReadingValues(unittest.TestCase):
@@ -149,6 +202,97 @@ class Comparing(unittest.TestCase):
         self.assertIsInstance(
             compare(ValueOp.EQ, "1", "60", Formula(Arith.DIV, Decimal(0))), Incomparable
         )
+
+
+class Blocks(unittest.TestCase):
+    def test_a_block_runs_from_the_line_its_tag_describes_to_its_end(self) -> None:
+        self.assertEqual(
+            ["private int vat(int net) {", "return net / 5;", "// rounded down", "}"],
+            block(
+                "/**",
+                " * COUPLED:vat:[same-as]",
+                " */",
+                "private int vat(int net) {",
+                "    return net / 5;",
+                "",
+                "    // rounded down",
+                "}",
+                "// COUPLED:vat:END",
+                "private int other() {",
+            ),
+        )
+
+    def test_a_block_ends_at_its_end_whatever_the_indentation(self) -> None:
+        self.assertEqual(
+            ["services:", "app:", "image: app", "worker:"],
+            block(
+                "# COUPLED:x:[same-shape]",
+                "services:",
+                "  app:",
+                "    image: app",
+                "worker:",
+                "# COUPLED:x:END",
+            ),
+        )
+
+    def test_a_trailing_tag_starts_the_block_on_its_own_line_without_its_comment(self) -> None:
+        self.assertEqual(
+            ["def f():", "return 1"],
+            block("def f():  # COUPLED:x:[same-as]", "    return 1", "# COUPLED:x:END"),
+        )
+
+    def test_a_tag_without_an_end_describes_only_its_line(self) -> None:
+        self.assertEqual(
+            ["def f():"], block("# COUPLED:x:[same-as]", "def f():", "    return 1", "")
+        )
+        self.assertEqual(
+            ["disable_functions = exec,popen"],
+            block("disable_functions = exec,popen ; COUPLED:x:[subset-of y]", "  other = 1"),
+        )
+
+    def test_the_tags_of_blocks_inside_a_block_are_not_part_of_it(self) -> None:
+        self.assertEqual(
+            ["def f():", "TABLE = {", "}", "x = 1", "return TABLE"],
+            block(
+                "# COUPLED:outer:[same-as]",
+                "def f():",
+                "    # COUPLED:inner:[same-shape;",
+                "    #   ./schema.json]",
+                "    TABLE = {",
+                "    }",
+                "    # COUPLED:inner:END",
+                "    x = 1  # COUPLED:other:[= Y]",
+                "    return TABLE",
+                "# COUPLED:outer:END",
+            ),
+        )
+
+    def test_a_tag_describing_no_line_has_no_block(self) -> None:
+        self.assertEqual([], block("x = 1", "# COUPLED:x:[same-as]"))
+
+    def test_a_tag_whose_end_comes_before_any_code_has_no_block(self) -> None:
+        self.assertEqual([], block("# COUPLED:x:[same-as]", "# COUPLED:x:END", "f()"))
+
+
+class Units(unittest.TestCase):
+    def test_a_number_s_unit_is_its_suffix(self) -> None:
+        self.assertEqual("m", unit_of("10m"))
+        self.assertEqual("M", unit_of("10M"))
+        self.assertEqual("ms", unit_of("65_000 ms"))
+
+    def test_a_number_without_a_suffix_or_a_non_number_has_no_unit(self) -> None:
+        for text in ("8", "3.12", "24.22.1", "/cache/", "node"):
+            with self.subTest(text=text):
+                self.assertIsNone(unit_of(text))
+
+
+class JsonAt(unittest.TestCase):
+    def test_a_pointer_reaches_a_subtree_written_canonically(self) -> None:
+        self.assertEqual('{"a": 1, "b": 2}', json_at('{"x": {"b": 2, "a": 1}}', "/x"))
+
+    def test_nothing_at_the_pointer_or_not_json_is_none(self) -> None:
+        self.assertIsNone(json_at('{"x": 1}', "/y"))
+        self.assertIsNone(json_at("x: 1", "/x"))
 
 
 if __name__ == "__main__":
